@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""agentctl — Lifecycle management for CLI agents via Agent Bus (port 9901).
+
+Usage:
+  agentctl spawn <agent> [--name <session>] [--model <model>]
+  agentctl list
+  agentctl send <agent> <message>
+  agentctl attach <agent>
+  agentctl capture <agent>
+  agentctl outbox <agent>
+  agentctl human
+  agentctl resolve <id> <response>
+  agentctl kill <agent>
+
+Examples:
+  agentctl spawn codex
+  agentctl spawn codex --name diagramtalk --model gpt-5.5
+  agentctl send codex "Please report status"
+  agentctl attach codex          # prints 'tmux attach -t <session>'
+  agentctl capture codex         # latest visible output
+  agentctl outbox codex          # messages from agent
+  agentctl human                 # pending human requests
+  agentctl resolve hum_abc123 "Add new endpoint"
+  agentctl kill codex
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+import urllib.error
+
+BUS_URL = os.environ.get("AGENT_BUS_URL", "http://127.0.0.1:9901")
+WRAPPER = os.path.expanduser("~/Software/scripts-ai/agent-bus-wrapper.sh")
+LOG_DIR = os.path.expanduser("~/.hermes/agent-logs")
+
+
+def _bus_get(path: str) -> dict:
+    url = f"{BUS_URL}{path}"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        data = e.read()
+        try:
+            return json.loads(data)
+        except json.JSONDecodeError:
+            return {"error": f"HTTP {e.code}: {data.decode(errors='replace')}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _bus_post(path: str, body: dict) -> dict:
+    url = f"{BUS_URL}{path}"
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data,
+                                 headers={"Content-Type": "application/json"},
+                                 method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        data = e.read()
+        try:
+            return json.loads(data)
+        except json.JSONDecodeError:
+            return {"error": f"HTTP {e.code}: {data.decode(errors='replace')}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _check_bus():
+    """Verify the Agent Bus is running."""
+    result = _bus_get("/bus")
+    if "error" in result:
+        print(f"Agent Bus non raggiungibile su {BUS_URL}", file=sys.stderr)
+        print(f"  Errore: {result['error']}", file=sys.stderr)
+        print(f"  Avvia con: launchctl start com.fausto.agent-bus", file=sys.stderr)
+        sys.exit(1)
+    return result
+
+
+def _find_agent(agent: str) -> dict:
+    """Find agent in bus, returning its data or None."""
+    bus = _bus_get("/bus")
+    if agent in bus:
+        return bus[agent]
+    # Try case-insensitive match
+    for name, data in bus.items():
+        if name.lower() == agent.lower():
+            return data
+    print(f"Agente '{agent}' non trovato sul bus.", file=sys.stderr)
+    print(f"  Agenti noti: {', '.join(bus.keys()) or '(nessuno)'}", file=sys.stderr)
+    sys.exit(1)
+
+
+def cmd_spawn(args):
+    """agentctl spawn <agent> [--name <session>] [--model <model>]"""
+    import argparse
+    parser = argparse.ArgumentParser(description="Spawn an agent in tmux with Agent Bus")
+    parser.add_argument("agent", help="Agent name (codex, claude, agy)")
+    parser.add_argument("--name", help="Custom tmux session name (default: auto)")
+    parser.add_argument("--model", help="Model override (e.g. gpt-5.5, claude-sonnet-4)")
+    parser.add_argument("--extra", nargs="*", help="Extra CLI args for the agent")
+    p = parser.parse_args(args)
+
+    agent = p.agent
+    session_name = p.name
+    model = p.model
+    extra = p.extra or []
+
+    # Build CLI command
+    cli_map = {
+        "codex": ["codex"],
+        "claude": ["claude"],
+        "claude-or": ["claude-or"],
+        "agy": ["agy", "--prompt-interactive"],
+    }
+
+    if agent not in cli_map:
+        known = ", ".join(cli_map.keys())
+        print(f"Agente sconosciuto: '{agent}'. Usa: {known}", file=sys.stderr)
+        sys.exit(1)
+
+    cmd = cli_map[agent]
+    if model:
+        cmd = cmd + ["--model", model]
+    cmd = cmd + extra
+
+    # Build wrapper args
+    wrapper_args = [WRAPPER]
+    if session_name:
+        wrapper_args += ["--name", session_name]
+    wrapper_args += [agent] + cmd
+
+    # Show what we're doing
+    cmd_str = " ".join(wrapper_args)
+    print(f"Avvio: {cmd_str}")
+    print()
+
+    # Spawn in background — we need a new process group so it doesn't die with us
+    proc = subprocess.Popen(
+        wrapper_args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+    # Wait a moment then read initial output
+    time.sleep(1.5)
+    try:
+        out, _ = proc.communicate(timeout=2)
+        output = out.decode(errors="replace") if out else ""
+    except subprocess.TimeoutExpired:
+        # Process still running — read what we can
+        try:
+            out, _ = proc.communicate(timeout=0.5)
+            output = out.decode(errors="replace") if out else ""
+        except:
+            output = ""
+
+    # Parse output for session info
+    session = session_name or f"agent-bus-{agent}-{proc.pid}"
+    # Try to extract from output
+    for line in output.split("\n"):
+        if "Session:" in line:
+            session = line.split("Session:")[-1].strip()
+        if "Reattach:" in line:
+            pass  # skip, we show our own
+
+    # Verify on bus
+    bus = _bus_get("/bus")
+    bus_data = None
+    if agent in bus and bus[agent].get("session"):
+        bus_data = bus[agent]
+
+    result = {
+        "agent": agent,
+        "session": session,
+        "pid": proc.pid,
+        "command": cmd_str,
+        "attach": f"tmux attach -t {session}",
+        "detach": "Ctrl+B D",
+        "status": "running" if bus_data else "starting",
+    }
+
+    print(json.dumps(result, indent=2))
+    print()
+    print(f"  Per attaccarti:  tmux attach -t {session}")
+    print(f"  Per staccarti:   Ctrl+B D")
+    print(f"  Per parlare:     agentctl send {agent} <messaggio>")
+    print(f"  Per vedere:      agentctl capture {agent}")
+
+
+def cmd_list(_args):
+    """agentctl list"""
+    _check_bus()
+    bus = _bus_get("/bus")
+
+    # Add log info
+    print(f"{'AGENTE':<12} {'SESSIONE':<20} {'INBOX':<6} {'OUTBOX':<7} {'TMUX':<8} {'LOGS':<10}")
+    print("-" * 70)
+
+    # Also check tmux for any bus sessions
+    tmux_out = subprocess.run(
+        ["tmux", "ls"], capture_output=True, text=True, timeout=3
+    ).stdout
+    tmux_sessions = set()
+    for line in tmux_out.split("\n"):
+        s = line.split(":")[0].strip()
+        if s and ("agent-bus-" in s or any(a in s for a in ["codex", "claude", "agy"])):
+            tmux_sessions.add(s)
+
+    for agent, data in sorted(bus.items()):
+        if data.get("session") is None and data.get("inbox_count", 0) == 0 and data.get("outbox_count", 0) == 0:
+            continue  # skip empty ghost entries
+        session = data.get("session") or "-"
+        alive = session in tmux_sessions if session and session != "-" else False
+        log_dir = os.path.join(LOG_DIR, agent)
+        log_count = len(os.listdir(log_dir)) if os.path.isdir(log_dir) else 0
+        print(f"{agent:<12} {str(session):<20} {data.get('inbox_count', 0):<6} {data.get('outbox_count', 0):<7} {'✅' if alive else '❌':<8} {log_count:<10}")
+
+    # Check for pending human requests
+    human = _bus_get("/bus/human")
+    if human and len(human) > 0:
+        print()
+        print(f"⚠️  Richieste umane in sospeso: {len(human)}")
+        for r in human:
+            print(f"   [{r['id']}] {r['agent']}: {r['question'][:80]}")
+
+
+def cmd_send(args):
+    """agentctl send <agent> <message>"""
+    if len(args) < 2:
+        print("Uso: agentctl send <agent> <message>", file=sys.stderr)
+        sys.exit(1)
+    agent = args[0]
+    message = " ".join(args[1:])
+    result = _bus_post(f"/bus/{agent}/inbox", {"text": message, "from": "hermes"})
+    if "error" in result:
+        print(f"Errore: {result['error']}", file=sys.stderr)
+        sys.exit(1)
+    print(f"✅ Messaggio accodato in inbox di '{agent}' (id: {result['id']})")
+
+
+def cmd_attach(args):
+    """agentctl attach <agent>"""
+    if not args:
+        print("Uso: agentctl attach <agent>", file=sys.stderr)
+        sys.exit(1)
+    agent = args[0]
+    data = _find_agent(agent)
+    session = data.get("session")
+    if not session:
+        print(f"Agente '{agent}' non ha una sessione tmux registrata.", file=sys.stderr)
+        sys.exit(1)
+    print(f"Per attaccarti a '{agent}' (sessione '{session}'):")
+    print(f"  tmux attach -t {session}")
+    print(f"Per staccarti: Ctrl+B D")
+
+
+def cmd_capture(args):
+    """agentctl capture <agent>"""
+    if not args:
+        print("Uso: agentctl capture <agent>", file=sys.stderr)
+        sys.exit(1)
+    agent = args[0]
+    result = _bus_get(f"/bus/{agent}/capture")
+    if "error" in result:
+        print(f"Errore: {result['error']}", file=sys.stderr)
+        sys.exit(1)
+    print(result.get("output", "(vuoto)"))
+
+
+def cmd_outbox(args):
+    """agentctl outbox <agent>"""
+    if not args:
+        print("Uso: agentctl outbox <agent>", file=sys.stderr)
+        sys.exit(1)
+    agent = args[0]
+    while True:
+        msg = _bus_get(f"/bus/{agent}/outbox")
+        if msg is None:
+            break
+        print(json.dumps(msg, indent=2))
+        print("---")
+
+
+def cmd_human(_args):
+    """agentctl human"""
+    result = _bus_get("/bus/human")
+    if not result:
+        print("Nessuna richiesta umana in sospeso.")
+        return
+    for r in result:
+        print(f"[{r['id']}] Agente: {r['agent']}")
+        print(f"  Domanda: {r['question']}")
+        print(f"  Contesto: {r.get('context', '-')}")
+        print(f"  Timestamp: {r['timestamp']}")
+        print(f"  Per rispondere: agentctl resolve {r['id']} \"la tua risposta\"")
+        print()
+
+
+def cmd_resolve(args):
+    """agentctl resolve <id> <response>"""
+    if len(args) < 2:
+        print("Uso: agentctl resolve <id> <response>", file=sys.stderr)
+        sys.exit(1)
+    rid = args[0]
+    response = " ".join(args[1:])
+    result = _bus_post("/bus/human", {"id": rid, "response": response})
+    if "error" in result:
+        print(f"Errore: {result['error']}", file=sys.stderr)
+        sys.exit(1)
+    print(f"✅ Richiesta '{rid}' risolta. Risposta iniettata nell'inbox dell'agente.")
+
+
+def cmd_kill(args):
+    """agentctl kill <agent>"""
+    if not args:
+        print("Uso: agentctl kill <agent>", file=sys.stderr)
+        sys.exit(1)
+    agent = args[0]
+    data = _find_agent(agent)
+    session = data.get("session")
+    if session:
+        subprocess.run(["tmux", "kill-session", "-t", session],
+                       capture_output=True, timeout=5)
+        print(f"✅ Sessione tmux '{session}' terminata.")
+    else:
+        print(f"⚠️  Nessuna sessione tmux registrata per '{agent}'.")
+    # Deregister
+    _bus_post(f"/bus/{agent}/session", {"session": None})
+    print(f"✅ Agente '{agent}' deregistrato dal bus.")
+
+
+def main():
+    _check_bus()
+
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__)
+        sys.exit(0)
+
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
+
+    commands = {
+        "spawn": cmd_spawn,
+        "list": cmd_list,
+        "ls": cmd_list,
+        "send": cmd_send,
+        "attach": cmd_attach,
+        "capture": cmd_capture,
+        "cap": cmd_capture,
+        "outbox": cmd_outbox,
+        "human": cmd_human,
+        "resolve": cmd_resolve,
+        "kill": cmd_kill,
+    }
+
+    if cmd not in commands:
+        print(f"Comando sconosciuto: '{cmd}'. Usa -h per help.", file=sys.stderr)
+        sys.exit(1)
+
+    commands[cmd](args)
+
+
+if __name__ == "__main__":
+    main()

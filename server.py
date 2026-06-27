@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
 
 
+TMUX_BIN = "/usr/local/bin/tmux"
 PORT = int(os.environ.get("AGENT_BUS_PORT", 9901))
 
 # ── In-memory storage ──────────────────────────────────────────────────
@@ -56,11 +57,11 @@ def _tmux_send_keys(session: str, text: str):
     """Send text to a tmux session pane via send-keys."""
     try:
         subprocess.run(
-            ["tmux", "send-keys", "-t", session, "-l", text],
+            [TMUX_BIN, "send-keys", "-t", session, "-l", text],
             capture_output=True, timeout=5,
         )
         subprocess.run(
-            ["tmux", "send-keys", "-t", session, "Enter"],
+            [TMUX_BIN, "send-keys", "-t", session, "Enter"],
             capture_output=True, timeout=5,
         )
         return True
@@ -72,7 +73,7 @@ def _tmux_capture_pane(session: str) -> Optional[str]:
     """Capture visible pane content from a tmux session."""
     try:
         r = subprocess.run(
-            ["tmux", "capture-pane", "-t", session, "-p"],
+            [TMUX_BIN, "capture-pane", "-t", session, "-p"],
             capture_output=True, timeout=5, text=True,
         )
         return _strip_ansi(r.stdout) if r.returncode == 0 else None
@@ -125,7 +126,7 @@ class BusHandler(BaseHTTPRequestHandler):
             alive = False
             if session:
                 r = subprocess.run(
-                    ["tmux", "has-session", "-t", session],
+                    [TMUX_BIN, "has-session", "-t", session],
                     capture_output=True, timeout=3,
                 )
                 alive = r.returncode == 0

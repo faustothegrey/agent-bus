@@ -121,10 +121,19 @@ class BusHandler(BaseHTTPRequestHandler):
     def _list_bus(self):
         result = {}
         for name, data in agents.items():
+            session = data["session"]
+            alive = False
+            if session:
+                r = subprocess.run(
+                    ["tmux", "has-session", "-t", session],
+                    capture_output=True, timeout=3,
+                )
+                alive = r.returncode == 0
             result[name] = {
                 "inbox_count": len(data["inbox"]),
                 "outbox_count": len(data["outbox"]),
-                "session": data["session"],
+                "session": session,
+                "alive": alive,
             }
         self._json(200, result)
 

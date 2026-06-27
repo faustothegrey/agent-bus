@@ -199,28 +199,19 @@ def cmd_list(_args):
     _check_bus()
     bus = _bus_get("/bus")
 
-    # Add log info
-    print(f"{'AGENTE':<12} {'SESSIONE':<20} {'INBOX':<6} {'OUTBOX':<7} {'TMUX':<8} {'LOGS':<10}")
-    print("-" * 70)
-
-    # Also check tmux for any bus sessions
-    tmux_out = subprocess.run(
-        ["tmux", "ls"], capture_output=True, text=True, timeout=3
-    ).stdout
-    tmux_sessions = set()
-    for line in tmux_out.split("\n"):
-        s = line.split(":")[0].strip()
-        if s and ("agent-bus-" in s or any(a in s for a in ["codex", "claude", "agy"])):
-            tmux_sessions.add(s)
+    header = f"{'AGENT':<12} {'SESSION':<20} {'INBOX':<6} {'OUTBOX':<7} {'ALIVE':<7} {'LOGS':<6}"
+    print(header)
+    print("-" * len(header))
 
     for agent, data in sorted(bus.items()):
         if data.get("session") is None and data.get("inbox_count", 0) == 0 and data.get("outbox_count", 0) == 0:
             continue  # skip empty ghost entries
         session = data.get("session") or "-"
-        alive = session in tmux_sessions if session and session != "-" else False
+        alive = data.get("alive", False)
         log_dir = os.path.join(LOG_DIR, agent)
         log_count = len(os.listdir(log_dir)) if os.path.isdir(log_dir) else 0
-        print(f"{agent:<12} {str(session):<20} {data.get('inbox_count', 0):<6} {data.get('outbox_count', 0):<7} {'✅' if alive else '❌':<8} {log_count:<10}")
+        icon = "✅" if alive else "❌"
+        print(f"{agent:<12} {str(session):<20} {data.get('inbox_count', 0):<6} {data.get('outbox_count', 0):<7} {icon:<7} {log_count:<6}")
 
     # Check for pending human requests
     human = _bus_get("/bus/human")

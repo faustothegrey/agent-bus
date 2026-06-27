@@ -97,31 +97,30 @@ _poll_inbox() {
 
 # ── Background monitor: watch for @HERMES in pane output ──────────────
 _monitor_hermes() {
+  set +e  # resilient — no errexit in the monitor
   local name="$1"
   local session="$2"
   local bus="$3"
-  # Simple approach: grep the pane for @HERMES lines we haven't seen
   local seen_markers="/tmp/agent-bus-${name}-seen-$$.tmp"
   : > "$seen_markers"
   while true; do
     pane=$(tmux capture-pane -t "$session" -p -S -200 2>/dev/null || true)
     if [ -n "$pane" ]; then
-      echo "$pane" | grep -o '@HERMES{[^}]*}' | while read -r match; do
+      echo "$pane" | grep -o '@HERMES{[^}]*}' 2>/dev/null | while read -r match; do
         marker=$(echo "$match" | md5 -q 2>/dev/null || echo "$match" | md5sum 2>/dev/null | cut -d' ' -f1)
-        if ! grep -q "$marker" "$seen_markers" 2>/dev/null; then
+        [ -z "$marker" ] && continue
+        if ! grep -qs "$marker" "$seen_markers" 2>/dev/null; then
           echo "$marker" >> "$seen_markers"
           payload=$(echo "$match" | sed 's/^@HERMES//')
-          if [ -n "$payload" ]; then
-            curl -s -X POST "$bus/bus/$name/outbox" \
-              -H 'Content-Type: application/json' \
-              -d "$payload" > /dev/null
-          fi
+          [ -n "$payload" ] && curl -s -X POST "$bus/bus/$name/outbox" \
+            -H 'Content-Type: application/json' \
+            -d "$payload" > /dev/null
         fi
       done
     fi
     sleep 2
   done
-  rm -f "$seen_markers"
+  rm -f "$seen_markers" 2>/dev/null || true
 }
 
 # Launch pollers in background

@@ -33,7 +33,7 @@ import urllib.request
 import urllib.error
 
 BUS_URL = os.environ.get("AGENT_BUS_URL", "http://127.0.0.1:9901")
-WRAPPER = os.path.expanduser("~/Software/scripts-ai/agent-bus-wrapper.sh")
+WRAPPER = os.path.expanduser("~/Software/scripts-ai/agent-bus/wrapper.sh")
 LOG_DIR = os.path.expanduser("~/.hermes/agent-logs")
 
 

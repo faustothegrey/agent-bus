@@ -134,6 +134,7 @@ class BusHandler(BaseHTTPRequestHandler):
                 "inbox_count": len(data["inbox"]),
                 "outbox_count": len(data["outbox"]),
                 "session": session,
+                "type": data.get("type"),
                 "alive": alive,
             }
         self._json(200, result)
@@ -213,6 +214,8 @@ class BusHandler(BaseHTTPRequestHandler):
         if not body or "session" not in body:
             return self._json(400, {"error": "body must have 'session' field"})
         agents[agent]["session"] = body["session"]
+        if "type" in body:
+            agents[agent]["type"] = body["type"]
         self._json(200, {"ok": True, "agent": agent, "session": body["session"]})
 
     def _inject_stdin(self, agent: str):

@@ -65,10 +65,10 @@ tmux new-session -d -s "$SESSION_NAME" \
 # Give it a moment to boot
 sleep 0.5
 
-# Register session with bus
+# Register session with bus — pass agent type too
 curl -s -X POST "$BUS_URL/bus/$AGENT_NAME/session" \
   -H 'Content-Type: application/json' \
-  -d "{\"session\":\"$SESSION_NAME\"}" > /dev/null
+  -d "{\"session\":\"$SESSION_NAME\",\"type\":\"$AGENT_NAME\"}" > /dev/null
 
 echo "Agent Bus: $AGENT_NAME"
 echo "  Session: $SESSION_NAME"

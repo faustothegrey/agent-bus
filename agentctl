@@ -13,6 +13,7 @@ Usage:
   agentctl list
   agentctl attach <agent>
   agentctl kill <agent>
+  agentctl health [--json]
 """
 
 import json
@@ -80,17 +81,94 @@ def session_alive(session: str) -> bool:
 
 # ── Health check ────────────────────────────────────────────────────────
 
-def get_load() -> float:
-    """Return the 1-minute load average."""
+def get_load_all() -> dict:
+    """Ritorna {1m, 5m, 15m} load."""
     try:
         raw = subprocess.run(
             ["sysctl", "-n", "vm.loadavg"],
             capture_output=True, timeout=3, text=True,
         ).stdout.strip()
-        # Format: { 1.23 4.56 7.89 }
-        return float(raw.split()[1])
+        parts = raw.strip("{}").split()
+        return {"1m": float(parts[0]), "5m": float(parts[1]), "15m": float(parts[2])}
     except (ValueError, IndexError, OSError):
-        return 0.0
+        return {"1m": 0.0, "5m": 0.0, "15m": 0.0}
+
+
+def check_all_agents() -> dict:
+    """Health check completo su tutti gli agenti.
+
+    Ritorna dict strutturato con load, processi per agente, anomalie.
+    """
+    load = get_load_all()
+    state = load_state()
+
+    # Costruisci known_pids da stato tmux
+    known_pids = set()
+    for a_data in state.values():
+        sess = a_data.get("session", "")
+        if sess and session_alive(sess):
+            try:
+                r = subprocess.run(
+                    [TMUX_BIN, "list-panes", "-t", sess, "-F", "#{pane_pid}"],
+                    capture_output=True, timeout=5, text=True,
+                )
+                for pid_str in r.stdout.strip().splitlines():
+                    if pid_str and pid_str.isdigit():
+                        known_pids.add(int(pid_str))
+            except (ValueError, OSError, subprocess.TimeoutExpired):
+                pass
+
+    agents = {}
+    all_anomalies = []
+
+    for agent_name in sorted(CLI_MAP.keys()):
+        procs = find_processes(agent_name)
+        orphans = [p for p in procs if p["pid"] not in known_pids]
+        known = [p for p in procs if p["pid"] in known_pids]
+
+        agent_info = {
+            "count": len(procs),
+            "processes": [
+                {
+                    "pid": p["pid"],
+                    "ppid": p["ppid"],
+                    "state": p["state"],
+                    "in_tmux": p["in_tmux"],
+                    "orphan": p["pid"] not in known_pids,
+                }
+                for p in procs
+            ],
+            "orphan_count": len(orphans),
+            "known_count": len(known),
+            "anomalies": [],
+        }
+
+        if len(procs) > 1:
+            msg = f"{len(procs)} processi in esecuzione ({len(orphans)} orfani, {len(known)} registrati)"
+            agent_info["anomalies"].append(f"DUPLICATES: {msg}")
+            all_anomalies.append(f"{agent_name}: DUPLICATES — {msg}")
+        elif len(procs) == 0 and agent_name in state:
+            # Registrato ma morto
+            agent_info["anomalies"].append("DEAD: registrato in stato ma nessun processo vivo")
+            all_anomalies.append(f"{agent_name}: DEAD — registrato ma nessun processo vivo")
+
+        agents[agent_name] = agent_info
+
+    # Load anomalies
+    if load["1m"] >= LOAD_CRIT:
+        all_anomalies.insert(0, f"LOAD_CRIT: {load['1m']:.1f}")
+    elif load["1m"] >= LOAD_WARN:
+        all_anomalies.insert(0, f"LOAD_WARN: {load['1m']:.1f}")
+
+    return {
+        "load": load,
+        "load_warn_threshold": LOAD_WARN,
+        "load_crit_threshold": LOAD_CRIT,
+        "agents": agents,
+        "anomaly_count": len(all_anomalies),
+        "anomalies": all_anomalies,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def find_processes(agent: str) -> list[dict]:
@@ -156,11 +234,11 @@ def check_health(agent: str) -> list[str]:
     issues = []
 
     # 1. Carico sistema
-    load_1m = get_load()
-    if load_1m >= LOAD_CRIT:
-        issues.append(f"🚨 CARICO CRITICO: {load_1m:.1f} (soglia: {LOAD_CRIT})")
-    elif load_1m >= LOAD_WARN:
-        issues.append(f"⚠️  CARICO ANOMALO: {load_1m:.1f} (soglia: {LOAD_WARN})")
+    load = get_load_all()["1m"]
+    if load >= LOAD_CRIT:
+        issues.append(f"🚨 CARICO CRITICO: {load:.1f} (soglia: {LOAD_CRIT})")
+    elif load >= LOAD_WARN:
+        issues.append(f"⚠️  CARICO ANOMALO: {load:.1f} (soglia: {LOAD_WARN})")
 
     # 2. Conteggio processi
     procs = find_processes(agent)
@@ -450,6 +528,53 @@ def cmd_kill(args: list[str]):
     print(f"✅ Agente '{agent}' rimosso dal registro.")
 
 
+def cmd_health(args: list[str]):
+    """agentctl health [--json]
+
+    Health check completo su tutti gli agenti (agy, claude, codex, claude-or).
+    Default: output umano. Con --json: output JSON strutturato.
+    """
+    use_json = "--json" in args
+
+    data = check_all_agents()
+
+    if use_json:
+        print(json.dumps(data, indent=2, default=str))
+        return
+
+    # Umano
+    load = data["load"]
+    sep = "─" * 52
+
+    print(sep)
+    print(f"  CARICO SISTEMA: {load['1m']:.1f} / {load['5m']:.1f} / {load['15m']:.1f}")
+    if data["anomaly_count"] > 0:
+        print(f"  ANOMALIE: {data['anomaly_count']}")
+    else:
+        print(f"  ✅ Tutto ok")
+    print(sep)
+
+    for agent_name, info in sorted(data["agents"].items()):
+        if info["count"] == 0:
+            print(f"  {agent_name:<12} — nessun processo")
+            continue
+
+        icon = "🟢" if info["orphan_count"] == 0 else "🟡"
+        print(f"  {icon} {agent_name:<12} {info['count']} processi"
+              f" ({info['known_count']} registrati, {info['orphan_count']} orfani)")
+        for proc in info["processes"]:
+            tag = " 🟢 tmux" if proc["in_tmux"] else " 🔴 orfano"
+            print(f"     └ PID {proc['pid']:>6} {tag}  PPID={proc['ppid']} [{proc['state']}]")
+
+    if data["anomalies"]:
+        print()
+        print("  ⚠️  ANOMALIE:")
+        for a in data["anomalies"]:
+            print(f"     • {a}")
+
+    print(sep)
+
+
 # ── Main ────────────────────────────────────────────────────────────────
 
 COMMANDS = {
@@ -458,6 +583,7 @@ COMMANDS = {
     "ls": cmd_list,
     "attach": cmd_attach,
     "kill": cmd_kill,
+    "health": cmd_health,
 }
 
 

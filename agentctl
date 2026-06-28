@@ -3,13 +3,12 @@
 
 Standalone: nessuna dipendenza da server HTTP o agent-bus.
 Usa solo tmux + un file JSON locale per registrare le sessioni.
+I tmux sono workspace per l'utente — Hermes orchestra via delegate_task.
 
 Usage:
   agentctl spawn <codex|claude|agy> [--name <session>] [--model <model>]
   agentctl list
-  agentctl send <agent> <message>
   agentctl attach <agent>
-  agentctl capture <agent>
   agentctl kill <agent>
 """
 
@@ -142,8 +141,6 @@ def cmd_spawn(args: list[str]):
     print()
     print(f"  tmux attach -t {session}    (per attaccarti)")
     print(f"  Ctrl+B D                    (per staccarti)")
-    print(f"  agentctl send {agent} ...    (per parlargli)")
-    print(f"  agentctl capture {agent}     (per vedere output)")
     print(f"  agentctl kill {agent}        (per fermarlo)")
 
 
@@ -177,51 +174,6 @@ def cmd_list(_args: list[str]):
     print(f"{alive_count}/{total} agenti attivi")
 
 
-def cmd_send(args: list[str]):
-    """agentctl send <agent> <message>"""
-    if len(args) < 2:
-        print("Uso: agentctl send <agent> <message>", file=sys.stderr)
-        sys.exit(1)
-
-    agent = args[0]
-    message = " ".join(args[1:])
-    state = load_state()
-
-    if agent not in state:
-        print(f"Agente '{agent}' non trovato.", file=sys.stderr)
-        print("  Usa 'agentctl list' per vedere gli agenti attivi.", file=sys.stderr)
-        sys.exit(1)
-
-    session = state[agent].get("session")
-    if not session:
-        print(f"Agente '{agent}' non ha una sessione tmux.", file=sys.stderr)
-        sys.exit(1)
-
-    if not session_alive(session):
-        print(f"Sessione tmux '{session}' non è più attiva.", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        # Escape first: chiude eventuali modal TUI (Claude, Codex)
-        subprocess.run(
-            [TMUX_BIN, "send-keys", "-t", session, "Escape"],
-            capture_output=True, timeout=3,
-        )
-        time.sleep(0.3)  # aspettiamo che la TUI processi Escape
-        subprocess.run(
-            [TMUX_BIN, "send-keys", "-t", session, "-l", message],
-            capture_output=True, timeout=5,
-        )
-        subprocess.run(
-            [TMUX_BIN, "send-keys", "-t", session, "Enter"],
-            capture_output=True, timeout=5,
-        )
-        print(f"✅ Messaggio inviato a '{agent}'")
-    except Exception as e:
-        print(f"Errore: {e}", file=sys.stderr)
-        sys.exit(1)
-
-
 def cmd_attach(args: list[str]):
     """agentctl attach <agent>"""
     if not args:
@@ -239,39 +191,6 @@ def cmd_attach(args: list[str]):
     print(f"Per attaccarti a '{agent}':")
     print(f"  tmux attach -t {session}")
     print(f"Per staccarti: Ctrl+B D (l'agente continua)")
-
-
-def cmd_capture(args: list[str]):
-    """agentctl capture <agent>"""
-    if not args:
-        print("Uso: agentctl capture <agent>", file=sys.stderr)
-        sys.exit(1)
-
-    agent = args[0]
-    state = load_state()
-
-    if agent not in state:
-        print(f"Agente '{agent}' non trovato.", file=sys.stderr)
-        sys.exit(1)
-
-    session = state[agent].get("session")
-    if not session:
-        print(f"Agente '{agent}' non ha sessione tmux.", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        r = subprocess.run(
-            [TMUX_BIN, "capture-pane", "-t", session, "-p"],
-            capture_output=True, timeout=5, text=True,
-        )
-        if r.returncode == 0:
-            print(r.stdout.strip())
-        else:
-            print(f"Errore: tmux capture-pane fallito.", file=sys.stderr)
-            sys.exit(1)
-    except Exception as e:
-        print(f"Errore: {e}", file=sys.stderr)
-        sys.exit(1)
 
 
 def cmd_kill(args: list[str]):
@@ -310,10 +229,7 @@ COMMANDS = {
     "spawn": cmd_spawn,
     "list": cmd_list,
     "ls": cmd_list,
-    "send": cmd_send,
     "attach": cmd_attach,
-    "capture": cmd_capture,
-    "cap": cmd_capture,
     "kill": cmd_kill,
 }
 

@@ -202,6 +202,12 @@ def cmd_send(args: list[str]):
         sys.exit(1)
 
     try:
+        # Escape first: chiude eventuali modal TUI (Claude, Codex)
+        subprocess.run(
+            [TMUX_BIN, "send-keys", "-t", session, "Escape"],
+            capture_output=True, timeout=3,
+        )
+        time.sleep(0.3)  # aspettiamo che la TUI processi Escape
         subprocess.run(
             [TMUX_BIN, "send-keys", "-t", session, "-l", message],
             capture_output=True, timeout=5,

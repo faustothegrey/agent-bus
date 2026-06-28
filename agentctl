@@ -5,6 +5,9 @@ Standalone: nessuna dipendenza da server HTTP o agent-bus.
 Usa solo tmux + un file JSON locale per registrare le sessioni.
 I tmux sono workspace per l'utente — Hermes orchestra via delegate_task.
 
+Allo spawn: health check automatico (duplicati + carico anomalo).
+Se rileva problemi: big warning + auto-pulizia dopo 2 minuti.
+
 Usage:
   agentctl spawn <codex|claude|agy> [--name <session>] [--model <model>]
   agentctl list
@@ -15,8 +18,10 @@ Usage:
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,14 +32,23 @@ os.environ.setdefault("TMUX_TMPDIR", TMUX_TMPDIR)
 TMUX_BIN = shutil.which("tmux") or "/usr/local/bin/tmux"
 STATE_FILE = Path.home() / ".hermes" / "agent-sessions.json"
 LOG_DIR = Path.home() / ".hermes" / "agent-logs"
-WRAPPER = os.path.expanduser("~/Software/scripts-ai/agent-bus/wrapper.sh")
+
+# Soglie health check
+LOAD_WARN = 10    # load 1-min ≥ 10 → warning
+LOAD_CRIT = 18    # load 1-min ≥ 18 → critico
+CLEANUP_WAIT = 120  # secondi prima dell'auto-pulizia
 
 CLI_MAP = {
-    "codex": ["codex"],
-    "claude": ["claude"],
-    "claude-or": ["claude-or"],
-    "agy": ["agy"],
+    "codex":       ["codex"],
+    "claude":      ["claude"],
+    "claude-or":   ["claude-or"],
+    "agy":         ["agy"],
 }
+
+# Flag file per cancellare l'auto-pulizia
+CANCEL_FLAG = Path.home() / ".hermes" / "agentctl-cancel.flag"
+
+_cleanup_cancelled = threading.Event()
 
 
 # ── State management ────────────────────────────────────────────────────
@@ -55,10 +69,6 @@ def save_state(state: dict):
         json.dump(state, f, indent=2)
 
 
-def ts() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def session_alive(session: str) -> bool:
     """Check if a tmux session exists."""
     r = subprocess.run(
@@ -66,6 +76,210 @@ def session_alive(session: str) -> bool:
         capture_output=True, timeout=5,
     )
     return r.returncode == 0
+
+
+# ── Health check ────────────────────────────────────────────────────────
+
+def get_load() -> float:
+    """Return the 1-minute load average."""
+    try:
+        raw = subprocess.run(
+            ["sysctl", "-n", "vm.loadavg"],
+            capture_output=True, timeout=3, text=True,
+        ).stdout.strip()
+        # Format: { 1.23 4.56 7.89 }
+        return float(raw.split()[1])
+    except (ValueError, IndexError, OSError):
+        return 0.0
+
+
+def find_processes(agent: str) -> list[dict]:
+    """Trova processi il cui eseguibile è esattamente <agent>.
+
+    Usa `comm` (nome eseguibile, non cmdline) per evitare falsi
+    positivi da script/tmux che hanno 'agy' nel path del log.
+
+    Ritorna lista di dict: {pid, ppid, state, cmdline, in_tmux}
+    """
+    procs = []
+    try:
+        r = subprocess.run(
+            ["ps", "axo", "pid,ppid,state,comm"],
+            capture_output=True, timeout=5, text=True,
+        )
+        for line in r.stdout.splitlines()[1:]:
+            parts = line.strip().split(None, 3)
+            if len(parts) < 4:
+                continue
+            pid_s, ppid_s, state, comm = parts
+            # comm è solo il nome base dell'eseguibile (es. "agy", "script")
+            # Script wrapper non va contato
+            if comm in ("script", "tmux"):
+                continue
+            if comm != agent:
+                continue
+            # Prendi anche la cmdline completa per contesto
+            cmdline = ""
+            try:
+                r2 = subprocess.run(
+                    ["ps", "-p", pid_s, "-o", "command="],
+                    capture_output=True, timeout=3, text=True,
+                )
+                cmdline = r2.stdout.strip()[:100]
+            except OSError:
+                pass
+            in_tmux = "script -q" in cmdline
+            procs.append({
+                "pid": int(pid_s),
+                "ppid": int(ppid_s),
+                "state": state,
+                "cmdline": cmdline or agent,
+                "in_tmux": in_tmux,
+            })
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        pass
+    return procs
+
+
+def find_orphans(agent: str, known_pids: set) -> list[dict]:
+    """Trova processi <agent> che non sono registrati in stato.
+
+    known_pids = set di PID che sono già nel nostro state (tmux registrati).
+    """
+    all_procs = find_processes(agent)
+    orphans = [p for p in all_procs if p["pid"] not in known_pids]
+    return orphans
+
+
+def check_health(agent: str) -> list[str]:
+    """Post-spawn health check. Ritorna lista di warning (vuota se OK)."""
+    issues = []
+
+    # 1. Carico sistema
+    load_1m = get_load()
+    if load_1m >= LOAD_CRIT:
+        issues.append(f"🚨 CARICO CRITICO: {load_1m:.1f} (soglia: {LOAD_CRIT})")
+    elif load_1m >= LOAD_WARN:
+        issues.append(f"⚠️  CARICO ANOMALO: {load_1m:.1f} (soglia: {LOAD_WARN})")
+
+    # 2. Conteggio processi
+    procs = find_processes(agent)
+    total = len(procs)
+
+    # Escludi il processo appena spawnato (dentro tmux)
+    state = load_state()
+    known_pids = set()
+    for a_data in state.values():
+        sess = a_data.get("session", "")
+        if sess and session_alive(sess):
+            # Cerca agy/claude/codex annidato sotto script -q dentro quel tmux
+            for p in procs:
+                # Se il processo è sotto tmux/script ed è lo stesso tipo, lo consideriamo noto
+                if p["in_tmux"] and p["pid"] not in known_pids:
+                    # Check se il tmux session contiene questo processo
+                    # Metodo semplice: c'è una relazione script→agent
+                    known_pids.add(p["pid"])
+                    break
+
+    orphans = [p for p in procs if p["pid"] not in known_pids]
+
+    if len(procs) > 1:
+        issues.append(
+            f"🔄 DUPLICATI: {total} processi '{agent}' in esecuzione"
+            f" ({len(orphans)} orfani, {len(known_pids)} registrati)"
+        )
+
+    return issues
+
+
+def print_big_warning(issues: list[str], agent: str, wait_sec: int):
+    """Stampa un grosso warning con stile."""
+    sep = "─" * 56
+    print()
+
+    # Intestazione
+    print(sep)
+    print(f"  ⚠️ ⚠️ ⚠️  HEALTH CHECK WARNING  ⚠️ ⚠️ ⚠️")
+    print(sep)
+    for issue in issues:
+        print(f"  {issue}")
+    print(sep)
+    print()
+    print(f"  ⏳ Tra {wait_sec} secondi pulisco automaticamente i duplicati")
+    print(f"     e gli orfani. Per cancellare l'auto-pulizia:")
+    print(f"       touch {CANCEL_FLAG}")
+    print(f"     Oppure Ctrl+C ora per annullare.")
+    print(sep)
+    print()
+
+
+def auto_clean(agent: str, issues: list[str], wait_sec: int):
+    """Background thread: sleep, poi pulisce duplicati/orfani."""
+    global _cleanup_cancelled
+
+    # Sleep con check cancellazione ogni 10 sec
+    for _ in range(wait_sec // 10):
+        if _cleanup_cancelled.is_set():
+            return
+        if CANCEL_FLAG.exists():
+            CANCEL_FLAG.unlink(missing_ok=True)
+            print(f"\n[agentctl] Auto-pulizia cancellata.", file=sys.stderr)
+            return
+        time.sleep(10)
+
+    if _cleanup_cancelled.is_set():
+        return
+
+    # Ri-valuta la situazione
+    state = load_state()
+    known_pids = set()
+
+    for a_name, a_data in list(state.items()):
+        sess = a_data.get("session", "")
+        if sess and session_alive(sess):
+            # Cerca il PID effettivo dentro la sessione tmux
+            try:
+                r = subprocess.run(
+                    [TMUX_BIN, "list-panes", "-t", sess, "-F", "#{pane_pid}"],
+                    capture_output=True, timeout=5, text=True,
+                )
+                for pid_str in r.stdout.strip().splitlines():
+                    if pid_str:
+                        known_pids.add(int(pid_str))
+            except (ValueError, OSError, subprocess.TimeoutExpired):
+                pass
+
+    orphans = find_orphans(agent, known_pids)
+
+    if not orphans:
+        return  # Già risolto
+
+    killed = 0
+    for op in orphans:
+        pid = op["pid"]
+        try:
+            os.kill(pid, signal.SIGTERM)
+            time.sleep(0.3)
+            if not os.path.exists(f"/proc/{pid}") and False:  # Linux-only
+                pass
+            # Su macOS, check ps dopo kill
+            r = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "pid="],
+                capture_output=True, timeout=3,
+            )
+            if r.returncode != 0:
+                killed += 1
+                continue
+            # SIGKILL se persiste
+            os.kill(pid, signal.SIGKILL)
+            time.sleep(0.2)
+            killed += 1
+        except (ProcessLookupError, OSError):
+            killed += 1  # Già morto
+
+    if killed > 0:
+        print(f"\n[agentctl] Auto-pulizia: {killed} processo/i '{agent}' orfano/i ucciso/i.",
+              file=sys.stderr)
 
 
 # ── Comandi ─────────────────────────────────────────────────────────────
@@ -132,6 +346,19 @@ def cmd_spawn(args: list[str]):
         "command": cmd_str,
     }
     save_state(state)
+
+    # ── Health check post-spawn ─────────────────────────────────────
+    issues = check_health(agent)
+    if issues:
+        print_big_warning(issues, agent, CLEANUP_WAIT)
+        # Lancia auto-pulizia in background
+        t = threading.Thread(
+            target=auto_clean,
+            args=(agent, issues, CLEANUP_WAIT),
+            daemon=True,
+        )
+        t.start()
+    # ─────────────────────────────────────────────────────────────────
 
     # Output
     print(f"✅ {agent} avviato in tmux")
@@ -235,6 +462,14 @@ COMMANDS = {
 
 
 def main():
+    # Trap Ctrl+C → cancella auto-pulizia
+    def _sigint(sig, frame):
+        _cleanup_cancelled.set()
+        print("\n[agentctl] Interrotto. Auto-pulizia cancellata.", file=sys.stderr)
+        sys.exit(130)
+
+    signal.signal(signal.SIGINT, _sigint)
+
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print(__doc__)
         sys.exit(0)

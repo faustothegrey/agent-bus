@@ -372,11 +372,13 @@ def cmd_spawn(args: list[str]):
                         help=f"Agente: {', '.join(CLI_MAP.keys())}")
     parser.add_argument("--name", help="Nome sessione tmux (opzionale)")
     parser.add_argument("--model", help="Modello override (es. claude-sonnet-4)")
+    parser.add_argument("--workdir", "-d", help="Directory di lavoro (es. /path/to/project)")
     p = parser.parse_args(args)
 
     agent = p.agent
     session_name = p.name
     model = p.model
+    workdir = p.workdir
 
     # Build CLI command
     cmd = list(CLI_MAP[agent])
@@ -395,6 +397,10 @@ def cmd_spawn(args: list[str]):
     # Create tmux session with script logging
     tmux_cmd = [
         TMUX_BIN, "new-session", "-d", "-s", session,
+    ]
+    if workdir:
+        tmux_cmd += ["-c", workdir]
+    tmux_cmd += [
         "script", "-q", str(logfile),
     ] + cmd
 
@@ -424,6 +430,7 @@ def cmd_spawn(args: list[str]):
         "model": model or "",
         "log": str(logfile),
         "command": cmd_str,
+        "workdir": workdir or "",
     }
     save_state(state)
 
@@ -444,6 +451,8 @@ def cmd_spawn(args: list[str]):
     print(f"✅ {agent} avviato in tmux")
     print(f"  Sessione: {session}")
     print(f"  Comando:  {cmd_str}")
+    if workdir:
+        print(f"  Directory: {workdir}")
     print(f"  Log:      {logfile}")
     print()
     print(f"  tmux attach -t {session}    (per attaccarti)")
@@ -459,8 +468,8 @@ def cmd_list(_args: list[str]):
         print("Nessun agente attivo.")
         return
 
-    print(f"{'AGENTE':<12} {'SESSIONE':<24} {'TMUX':<7} {'LOG':<6}")
-    print("-" * 60)
+    print(f"{'AGENTE':<12} {'SESSIONE':<24} {'DIR':<24} {'TMUX':<7} {'LOG':<6}")
+    print("-" * 76)
 
     for agent, data in sorted(state.items()):
         session = data.get("session", "-")
@@ -469,9 +478,10 @@ def cmd_list(_args: list[str]):
         log_dir = LOG_DIR / agent
         if log_dir.is_dir():
             log_count = len(list(log_dir.glob("*.log")))
+        workdir = data.get("workdir", "") or ""
 
         icon = "🟢" if alive else "🔴"
-        print(f"{agent:<12} {str(session):<24} {icon:<7} {log_count:<6}")
+        print(f"{agent:<12} {str(session):<24} {str(workdir):<24} {icon:<7} {log_count:<6}")
 
     # Summary
     alive_count = sum(1 for d in state.values()

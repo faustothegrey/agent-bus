@@ -116,7 +116,10 @@ def check_all_agents() -> dict:
                 )
                 for pid_str in r.stdout.strip().splitlines():
                     if pid_str and pid_str.isdigit():
-                        known_pids.add(int(pid_str))
+                        pane_pid = int(pid_str)
+                        known_pids.add(pane_pid)
+                        # Includi discendenti (es. script → node → codex)
+                        known_pids.update(get_descendants(pane_pid))
             except (ValueError, OSError, subprocess.TimeoutExpired):
                 pass
 
@@ -173,11 +176,47 @@ def check_all_agents() -> dict:
     }
 
 
+def get_descendants(pid: int) -> set[int]:
+    """Ritorna tutti i PID discendenti (figli, nipoti, ...) di <pid>.
+
+    Scansiona ps axo ppid,pid e costruisce l'albero in memoria,
+    poi BFS/DFS dal PID radice.
+    """
+    descendants = set()
+    try:
+        r = subprocess.run(
+            ["ps", "axo", "ppid,pid"],
+            capture_output=True, timeout=3, text=True,
+        )
+        parent_map: dict[int, list[int]] = {}
+        for line in r.stdout.splitlines()[1:]:
+            parts = line.strip().split()
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                pp = int(parts[0])
+                cp = int(parts[1])
+                parent_map.setdefault(pp, []).append(cp)
+
+        stack = [pid]
+        while stack:
+            p = stack.pop()
+            for child in parent_map.get(p, []):
+                if child not in descendants:
+                    descendants.add(child)
+                    stack.append(child)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        pass
+    return descendants
+
+
 def find_processes(agent: str) -> list[dict]:
-    """Trova processi il cui eseguibile è esattamente <agent>.
+    """Trova processi il cui eseguibile è <agent>.
 
     Usa `comm` (nome eseguibile, non cmdline) per evitare falsi
     positivi da script/tmux che hanno 'agy' nel path del log.
+
+    Attenzione macOS: `ps axo comm` mostra il FULL PATH per alcuni
+    eseguibili (codex via node). Usiamo un match substring cosi'
+    che '/usr/local/.../codex' matchi 'codex'.
 
     Ritorna lista di dict: {pid, ppid, state, cmdline, in_tmux}
     """
@@ -192,11 +231,12 @@ def find_processes(agent: str) -> list[dict]:
             if len(parts) < 4:
                 continue
             pid_s, ppid_s, state, comm = parts
-            # comm è solo il nome base dell'eseguibile (es. "agy", "script")
+            # comm e' il nome base o full path su macOS — filtra via basename
+            comm_basename = os.path.basename(comm) if "/" in comm else comm
             # Script wrapper non va contato
-            if comm in ("script", "tmux"):
+            if comm_basename in ("script", "tmux"):
                 continue
-            if comm != agent:
+            if comm_basename != agent:
                 continue
             # Prendi anche la cmdline completa per contesto
             cmdline = ""
@@ -360,6 +400,20 @@ def auto_clean(agent: str, issues: list[str], wait_sec: int):
     if killed > 0:
         print(f"\n[agentctl] Auto-pulizia: {killed} processo/i '{agent}' orfano/i ucciso/i.",
               file=sys.stderr)
+
+
+def tmux_checked(args: list[str], **kwargs) -> subprocess.CompletedProcess:
+    """Run tmux and raise a useful error when the command fails."""
+    result = subprocess.run(
+        [TMUX_BIN, *args],
+        capture_output=True,
+        text=True,
+        **kwargs,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(detail or f"tmux exited with {result.returncode}")
+    return result
 
 
 # ── Comandi ─────────────────────────────────────────────────────────────
@@ -617,19 +671,16 @@ def cmd_send(args: list[str]):
 
     try:
         # Escape first: chiude eventuali modal TUI
-        subprocess.run(
-            [TMUX_BIN, "send-keys", "-t", session, "Escape"],
-            capture_output=True, timeout=3,
-        )
+        tmux_checked(["send-keys", "-t", session, "Escape"], timeout=3)
         time.sleep(0.3)
-        subprocess.run(
-            [TMUX_BIN, "send-keys", "-t", session, "-l", message],
-            capture_output=True, timeout=5,
-        )
-        subprocess.run(
-            [TMUX_BIN, "send-keys", "-t", session, "Enter"],
-            capture_output=True, timeout=5,
-        )
+        buffer_name = f"agentctl-{os.getpid()}-{int(time.time() * 1000)}"
+
+        # Paste via a tmux buffer instead of send-keys -l. This is more reliable
+        # for long prompts and keeps submission as a separate keystroke.
+        tmux_checked(["load-buffer", "-b", buffer_name, "-"], input=message, timeout=5)
+        tmux_checked(["paste-buffer", "-d", "-b", buffer_name, "-t", session], timeout=5)
+        time.sleep(0.15)
+        tmux_checked(["send-keys", "-t", session, "C-m"], timeout=5)
         print(f"✅ Messaggio inviato a '{agent}'")
     except Exception as e:
         print(f"Errore: {e}", file=sys.stderr)

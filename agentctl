@@ -645,7 +645,7 @@ def cmd_send(args: list[str]):
     """agentctl send <agent> <message>
 
     Invia un messaggio a un agente in tmux.
-    Gestisce automaticamente Escape per uscire da modalità TUI.
+    (Nessun Escape preventivo: interromperebbe un turno in corso — LB-49.)
     """
     if len(args) < 2:
         print("Uso: agentctl send <agent> <message>", file=sys.stderr)
@@ -670,9 +670,10 @@ def cmd_send(args: list[str]):
         sys.exit(1)
 
     try:
-        # Escape first: chiude eventuali modal TUI
-        tmux_checked(["send-keys", "-t", session, "Escape"], timeout=3)
-        time.sleep(0.3)
+        # LB-49 defect 3: NIENTE Escape preventivo — in Claude Code (e codex)
+        # Esc interrompe il turno in corso, distruggendo la risposta alla
+        # fonte. Costo accettato: un modal TUI aperto può assorbire il paste
+        # (fallimento minore, visibile all'operatore).
         buffer_name = f"agentctl-{os.getpid()}-{int(time.time() * 1000)}"
 
         # Paste via a tmux buffer instead of send-keys -l. This is more reliable
@@ -685,6 +686,65 @@ def cmd_send(args: list[str]):
     except Exception as e:
         print(f"Errore: {e}", file=sys.stderr)
         sys.exit(1)
+
+
+def transcript_capture(entry: dict):
+    """Ultima risposta completa dal transcript di sessione di Claude Code.
+
+    Claude Code gira nell'alternate screen di tmux (LB-49 defect 1): il
+    viewport è tutto ciò che capture-pane può mai vedere (history_size resta
+    0), quindi le risposte lunghe sono irrecuperabili da tmux. Il CLI però
+    scrive il transcript strutturato completo in
+    ~/.claude/projects/<slug>/<session>.jsonl — si legge quello.
+
+    Ritorna None se il transcript non c'è (il chiamante fa fallback su tmux).
+    """
+    workdir = entry.get("workdir") or ""
+    if not workdir:
+        return None
+    proj = Path.home() / ".claude" / "projects" / workdir.replace("/", "-")
+    if not proj.is_dir():
+        return None
+    files = sorted(proj.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        return None
+
+    lines = []
+    try:
+        with open(files[0]) as f:
+            for raw in f:
+                try:
+                    lines.append(json.loads(raw))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return None
+
+    # Ultimo turno utente REALE (i tool_result arrivano come type:"user" ma
+    # non sono l'operatore che parla — vanno saltati).
+    last_user = -1
+    for i, obj in enumerate(lines):
+        if obj.get("type") != "user":
+            continue
+        content = (obj.get("message") or {}).get("content")
+        if isinstance(content, str):
+            last_user = i
+        elif isinstance(content, list):
+            if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+                continue
+            if any(isinstance(b, dict) and b.get("type") == "text" for b in content):
+                last_user = i
+
+    chunks = []
+    for obj in lines[last_user + 1:]:
+        if obj.get("type") != "assistant":
+            continue
+        for b in (obj.get("message") or {}).get("content") or []:
+            if isinstance(b, dict) and b.get("type") == "text" and b.get("text"):
+                chunks.append(b["text"])
+    if not chunks:
+        return None
+    return "\n\n".join(chunks).strip()
 
 
 def cmd_capture(args: list[str]):
@@ -709,9 +769,19 @@ def cmd_capture(args: list[str]):
         print(f"Agente '{agent}' non ha sessione tmux.", file=sys.stderr)
         sys.exit(1)
 
+    # LB-49 defect 1: per claude il pane è alternate-screen → si legge il
+    # transcript di sessione (completo). Fallback su tmux se manca.
+    if state[agent].get("type") == "claude":
+        text = transcript_capture(state[agent])
+        if text is not None:
+            print(text)
+            return
+
     try:
+        # LB-49 defect 2: -S - cattura TUTTA la history (non il solo viewport
+        # visibile); -J riunisce le righe wrappate a larghezza pane.
         r = subprocess.run(
-            [TMUX_BIN, "capture-pane", "-t", session, "-p"],
+            [TMUX_BIN, "capture-pane", "-t", session, "-p", "-S", "-", "-J"],
             capture_output=True, timeout=5, text=True,
         )
         if r.returncode == 0:

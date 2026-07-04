@@ -123,11 +123,38 @@ def check_all_agents() -> dict:
             except (ValueError, OSError, subprocess.TimeoutExpired):
                 pass
 
+    # ── Quota-monitoring transient sessions ───────────────────────
+    # tmux sessions named ai_cli_quotas_* are created by the quota
+    # monitoring system (api.py) every ~10min and last ~35s. Their
+    # agent processes would appear as orphans/duplicates in the
+    # health check. Exclude their PID trees from orphan detection.
+    quota_pids = set()
+    try:
+        r = subprocess.run(
+            [TMUX_BIN, "list-sessions", "-F", "#{session_name}"],
+            capture_output=True, timeout=5, text=True,
+        )
+        for sess_name in r.stdout.strip().splitlines():
+            if sess_name.startswith("ai_cli_quotas_"):
+                r2 = subprocess.run(
+                    [TMUX_BIN, "list-panes", "-t", sess_name, "-F", "#{pane_pid}"],
+                    capture_output=True, timeout=5, text=True,
+                )
+                for pid_str in r2.stdout.strip().splitlines():
+                    if pid_str and pid_str.isdigit():
+                        pane_pid = int(pid_str)
+                        quota_pids.add(pane_pid)
+                        quota_pids.update(get_descendants(pane_pid))
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
     agents = {}
     all_anomalies = []
 
     for agent_name in sorted(CLI_MAP.keys()):
         procs = find_processes(agent_name)
+        # Exclude quota-monitoring transient processes
+        procs = [p for p in procs if p["pid"] not in quota_pids]
         orphans = [p for p in procs if p["pid"] not in known_pids]
         known = [p for p in procs if p["pid"] in known_pids]
 
